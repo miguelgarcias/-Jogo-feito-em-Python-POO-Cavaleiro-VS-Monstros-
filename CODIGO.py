@@ -1,8 +1,10 @@
+import os
 import arcade
 import random
 import math
 import datetime
 
+from PIL import Image
 from peewee import (SqliteDatabase, Model, CharField, IntegerField,
                     FloatField, DateTimeField)
 
@@ -21,6 +23,19 @@ TAMANHO_AVATAR_PX = 90
 TAMANHO_MOEDA_ESPECIAL_PX = 32
 DURACAO_INVULNERABILIDADE = 1.0
 
+# ---------- Efeitos de dano ----------
+DURACAO_TREMOR = 0.35        # segundos de tela tremendo
+INTENSIDADE_TREMOR = 12      # deslocamento máximo (px) no início do tremor
+DURACAO_FLASH = 0.25         # segundos do clarão vermelho na tela
+COR_NORMAL = (255, 255, 255, 255)
+COR_DANO = (255, 70, 70, 255)
+MARGEM_FUNDO = 20            # fundo/chão maiores que a tela para o tremor não mostrar bordas
+
+# ---------- Resultados da partida ----------
+VITORIA_PERFEITA = "vitoria_perfeita"   # todas as moedas e nenhuma vez atingido
+VITORIA_NORMAL = "vitoria_normal"       # todas as moedas, mas foi atingido
+DERROTA = "derrota"                     # pontuação ficou negativa
+
 # ---------- Física / cenário ----------
 GRAVIDADE = 0.8
 FORCA_PULO = 15
@@ -35,8 +50,9 @@ PLATAFORMAS = [
 ]
 
 # ---------- Spritesheet do jogador ----------
-# Arquivo: sprites/player_sheet.png  (faixa horizontal, personagem virado p/ direita)
+# Gerada automaticamente a partir de sprites/player_direita.png
 # Quadros: 0 = parado | 1 = pulo | 2 e 3 = caminhada
+SPRITE_BASE_JOGADOR = "sprites/player_direita.png"
 SHEET_ARQUIVO = "sprites/player_sheet.png"
 QUADRO_LARGURA = 64
 QUADRO_ALTURA = 64
@@ -83,6 +99,31 @@ def iniciar_banco():
 def calcular_escala(textura: arcade.Texture, tamanho_alvo_px: float) -> float:
     """Escala a textura para que seu maior lado tenha 'tamanho_alvo_px' px na tela."""
     return tamanho_alvo_px / max(textura.width, textura.height)
+
+
+def gerar_spritesheet(forcar: bool = False) -> None:
+    """Monta sprites/player_sheet.png (4 quadros de 64x64) a partir da sprite
+    antiga do jogador. Só gera se o arquivo ainda não existir (ou se forcar=True)."""
+    if os.path.exists(SHEET_ARQUIVO) and not forcar:
+        return
+
+    base = Image.open(SPRITE_BASE_JOGADOR).convert("RGBA")
+    base.thumbnail((QUADRO_LARGURA, QUADRO_ALTURA))  # reduz mantendo a proporção
+
+    def quadro(altura_pe: int = 0) -> Image.Image:
+        q = Image.new("RGBA", (QUADRO_LARGURA, QUADRO_ALTURA), (0, 0, 0, 0))
+        x = (QUADRO_LARGURA - base.width) // 2
+        y = QUADRO_ALTURA - base.height - altura_pe
+        q.paste(base, (x, y), base)
+        return q
+
+    # 0 = parado | 1 = pulo (sprite "no ar") | 2 e 3 = caminhada (leve "pulinho")
+    quadros = [quadro(0), quadro(6), quadro(0), quadro(4)]
+
+    sheet = Image.new("RGBA", (QUADRO_LARGURA * SHEET_COLUNAS, QUADRO_ALTURA), (0, 0, 0, 0))
+    for i, q in enumerate(quadros):
+        sheet.paste(q, (i * QUADRO_LARGURA, 0))
+    sheet.save(SHEET_ARQUIVO)
 
 
 # =====================================================================
@@ -276,7 +317,7 @@ class InstrucoesView(arcade.View):
 
     def on_draw(self):
         self.clear()
-        arcade.draw_text("Instruções", LARGURA / 2, ALTURA - 70, arcade.color.WHITE,
+        arcade.draw_text("Instruções", LARGURA / 2, ALTURA - 60, arcade.color.WHITE,
                           font_size=32, anchor_x="center", bold=True)
 
         linhas = [
@@ -288,20 +329,21 @@ class InstrucoesView(arcade.View):
             "O inimigo roxo persegue você lentamente; ao tocá-lo, você perde 1 ponto",
             "e ele é teletransportado para um novo local, recomeçando a perseguição.",
             "Após ser atingido, você fica 1 segundo protegido contra novos toques.",
-            "Cuidado: se a pontuação ficar negativa, é Fim de Jogo (derrota) na hora!",
-            "Você vence coletando todas as moedas antes que isso aconteça.",
+            "Derrota: se a pontuação ficar negativa, é Fim de Jogo na hora!",
+            "Vitória: colete todas as moedas antes que isso aconteça.",
+            "Vitória PERFEITA: colete todas as moedas sem ser atingido nenhuma vez!",
             "",
             "Controles:",
             "  Setas ou A / D - andar    |    W, Seta para cima ou ESPAÇO - pular",
             "  ESC - durante o jogo, interrompe a partida e volta ao Menu",
         ]
-        y = ALTURA - 130
+        y = ALTURA - 115
         for linha in linhas:
             arcade.draw_text(linha, LARGURA / 2, y, arcade.color.WHITE,
                               font_size=15, anchor_x="center")
-            y -= 30
+            y -= 28
 
-        arcade.draw_text("[ESC] / [M] Voltar ao Menu", LARGURA / 2, 40,
+        arcade.draw_text("[ESC] / [M] Voltar ao Menu", LARGURA / 2, 30,
                           arcade.color.LIGHT_GRAY, font_size=16, anchor_x="center")
 
     def on_key_press(self, key, modifiers):
@@ -344,6 +386,7 @@ class JogoView(arcade.View):
         super().__init__()
         self.player = None
         self.physics = None
+        self.camera = None
         self.sprite_jogador = None
         self.sprite_blocos = None
         self.sprite_moedas = None
@@ -351,20 +394,28 @@ class JogoView(arcade.View):
         self.sprite_inimigos = None
         self.sprite_inimigos_especiais = None
 
+        self.teclas = set()          # teclas atualmente pressionadas
         self.pontuacao = 0
+        self.vezes_atingido = 0
         self.tempo_decorrido = 0.0
         self.alerta_timer = 0.0
         self.texto_alerta = ""
         # invulneravel_timer > 0: jogador imune a novos toques (evita perder
         # pontos em todo quadro enquanto os sprites ainda estão sobrepostos).
         self.invulneravel_timer = 0.0
+        # efeitos de dano
+        self.tremor_timer = 0.0
+        self.tremor_dx = 0.0
+        self.tremor_dy = 0.0
+        self.flash_timer = 0.0
 
     def criar_cenario(self):
         """Monta o chão e as plataformas suspensas com a classe Bloco."""
         self.sprite_blocos = arcade.SpriteList()
 
-        # chão: uma fileira de blocos cobrindo toda a largura
-        for coluna in range(LARGURA // TAMANHO_BLOCO):
+        # chão: fileira de blocos cobrindo toda a largura (+1 bloco extra de cada
+        # lado, fora da tela, para o tremor de câmera não mostrar buracos)
+        for coluna in range(-1, LARGURA // TAMANHO_BLOCO + 1):
             x = coluna * TAMANHO_BLOCO + TAMANHO_BLOCO / 2
             self.sprite_blocos.append(Bloco(x, TAMANHO_BLOCO / 2))
 
@@ -377,7 +428,10 @@ class JogoView(arcade.View):
     def setup(self):
         self.window.background_color = (46, 147, 255)
         self.fundo = arcade.load_texture("sprites/fundo.png")
-        self.retangulo_fundo = arcade.LBWH(0, 0, LARGURA, ALTURA)
+        self.retangulo_fundo = arcade.LBWH(-MARGEM_FUNDO, -MARGEM_FUNDO,
+                                           LARGURA + 2 * MARGEM_FUNDO,
+                                           ALTURA + 2 * MARGEM_FUNDO)
+        self.camera = arcade.Camera2D()
 
         self.criar_cenario()
 
@@ -392,9 +446,10 @@ class JogoView(arcade.View):
             self.player, walls=self.sprite_blocos, gravity_constant=GRAVIDADE
         )
 
-        # moedas sobre blocos sorteados (chão ou plataformas)
+        # moedas sobre blocos sorteados (só blocos visíveis: chão ou plataformas)
+        candidatos = [b for b in self.sprite_blocos if 0 < b.center_x < LARGURA]
         self.sprite_moedas = arcade.SpriteList()
-        for bloco in random.sample(list(self.sprite_blocos), TOTAL_MOEDAS):
+        for bloco in random.sample(candidatos, TOTAL_MOEDAS):
             moeda = Moeda()
             moeda.center_x = bloco.center_x
             moeda.center_y = bloco.top + 20
@@ -418,24 +473,41 @@ class JogoView(arcade.View):
         inimigo_especial.center_y = 500
         self.sprite_inimigos_especiais.append(inimigo_especial)
 
+        self.teclas.clear()
         self.pontuacao = 0
+        self.vezes_atingido = 0
         self.tempo_decorrido = 0.0
         self.alerta_timer = 0.0
         self.invulneravel_timer = 0.0
+        self.tremor_timer = 0.0
+        self.tremor_dx = 0.0
+        self.tremor_dy = 0.0
+        self.flash_timer = 0.0
 
     def on_show_view(self):
         self.setup()
 
     def on_draw(self):
         self.clear()
-        arcade.draw_texture_rect(self.fundo, self.retangulo_fundo)
-        self.sprite_blocos.draw()
-        self.sprite_moedas.draw()
-        self.sprite_moedas_especiais.draw()
-        self.sprite_inimigos.draw()
-        self.sprite_inimigos_especiais.draw()
-        self.sprite_jogador.draw()
 
+        # --- mundo do jogo (com a câmera que pode tremer) ---
+        self.camera.position = (LARGURA / 2 + self.tremor_dx,
+                                ALTURA / 2 + self.tremor_dy)
+        with self.camera.activate():
+            arcade.draw_texture_rect(self.fundo, self.retangulo_fundo)
+            self.sprite_blocos.draw()
+            self.sprite_moedas.draw()
+            self.sprite_moedas_especiais.draw()
+            self.sprite_inimigos.draw()
+            self.sprite_inimigos_especiais.draw()
+            self.sprite_jogador.draw()
+
+        # --- clarão vermelho de dano (some rapidamente) ---
+        if self.flash_timer > 0:
+            alpha = int(110 * self.flash_timer / DURACAO_FLASH)
+            arcade.draw_rect_filled(arcade.LBWH(0, 0, LARGURA, ALTURA), (255, 0, 0, alpha))
+
+        # --- HUD (fixo, não treme) ---
         arcade.draw_text(f"Pontuação: {self.pontuacao}", 10, ALTURA - 25,
                           arcade.color.WHITE, 16)
         arcade.draw_text(f"Tempo: {self.tempo_decorrido:.1f}s", 10, ALTURA - 50,
@@ -447,12 +519,41 @@ class JogoView(arcade.View):
             arcade.draw_text(self.texto_alerta, LARGURA / 2, ALTURA - 30,
                               arcade.color.RED, 20, anchor_x="center", bold=True)
 
+    def atualizar_direcao(self):
+        """Calcula change_x a partir das teclas que estão pressionadas AGORA.
+        Assim, soltar uma tecla não cancela a outra que continua apertada."""
+        esquerda = arcade.key.A in self.teclas or arcade.key.LEFT in self.teclas
+        direita = arcade.key.D in self.teclas or arcade.key.RIGHT in self.teclas
+        self.player.change_x = (int(direita) - int(esquerda)) * VELOCIDADE_JOGADOR
+
+    def atualizar_efeitos(self, delta_time):
+        # tremor de tela: força diminui até zero
+        if self.tremor_timer > 0:
+            self.tremor_timer = max(0.0, self.tremor_timer - delta_time)
+            forca = INTENSIDADE_TREMOR * self.tremor_timer / DURACAO_TREMOR
+            self.tremor_dx = random.uniform(-forca, forca)
+            self.tremor_dy = random.uniform(-forca, forca)
+        else:
+            self.tremor_dx = 0.0
+            self.tremor_dy = 0.0
+
+        if self.flash_timer > 0:
+            self.flash_timer = max(0.0, self.flash_timer - delta_time)
+
+        # jogador pisca em vermelho enquanto está invulnerável
+        if self.invulneravel_timer > 0 and int(self.invulneravel_timer * 10) % 2 == 0:
+            self.player.color = COR_DANO
+        else:
+            self.player.color = COR_NORMAL
+
     def on_update(self, delta_time):
         self.tempo_decorrido += delta_time
         if self.alerta_timer > 0:
             self.alerta_timer -= delta_time
         if self.invulneravel_timer > 0:
             self.invulneravel_timer -= delta_time
+
+        self.atualizar_direcao()
 
         # 1º física (move o jogador), 2º animação (Player.update)
         self.physics.update()
@@ -465,15 +566,31 @@ class JogoView(arcade.View):
         self.sprite_inimigos_especiais.update(delta_time)
 
         self.verificar_colisoes()
+        self.atualizar_efeitos(delta_time)
 
         if self.pontuacao < 0:
-            self.window.show_view(
-                GameOverView(self.pontuacao, self.tempo_decorrido, venceu=False)
-            )
+            self.finalizar(DERROTA)
         elif len(self.sprite_moedas) == 0:
-            self.window.show_view(
-                GameOverView(self.pontuacao, self.tempo_decorrido, venceu=True)
-            )
+            if self.vezes_atingido == 0:
+                self.finalizar(VITORIA_PERFEITA)
+            else:
+                self.finalizar(VITORIA_NORMAL)
+
+    def finalizar(self, resultado: str):
+        self.window.show_view(
+            GameOverView(self.pontuacao, self.tempo_decorrido, resultado,
+                         self.vezes_atingido)
+        )
+
+    def tomar_dano(self, texto: str, penalidade: int):
+        """Aplica penalidade e dispara todos os efeitos de dano."""
+        self.pontuacao -= penalidade
+        self.vezes_atingido += 1
+        self.alerta_timer = 1.0
+        self.texto_alerta = texto
+        self.invulneravel_timer = DURACAO_INVULNERABILIDADE
+        self.tremor_timer = DURACAO_TREMOR
+        self.flash_timer = DURACAO_FLASH
 
     def verificar_colisoes(self):
         for moeda in arcade.check_for_collision_with_list(self.player, self.sprite_moedas):
@@ -488,47 +605,39 @@ class JogoView(arcade.View):
             return
 
         if arcade.check_for_collision_with_list(self.player, self.sprite_inimigos):
-            self.pontuacao -= Inimigo.PENALIDADE
-            self.alerta_timer = 1.0
-            self.texto_alerta = "Cuidado! O inimigo te atingiu!"
-            self.invulneravel_timer = DURACAO_INVULNERABILIDADE
+            self.tomar_dano("Cuidado! O inimigo te atingiu!", Inimigo.PENALIDADE)
             return
 
         perseguidores = arcade.check_for_collision_with_list(self.player, self.sprite_inimigos_especiais)
         if perseguidores:
-            self.pontuacao -= InimigoEspecial.PENALIDADE
-            self.alerta_timer = 1.0
-            self.texto_alerta = "O perseguidor te alcançou!"
+            self.tomar_dano("O perseguidor te alcançou!", InimigoEspecial.PENALIDADE)
             for perseguidor in perseguidores:
                 perseguidor.teletransportar()
-            self.invulneravel_timer = DURACAO_INVULNERABILIDADE
 
     def on_key_press(self, key, modifiers):
         if key == arcade.key.ESCAPE:
             self.window.show_view(MenuView())
             return
-        if key in (arcade.key.D, arcade.key.RIGHT):
-            self.player.change_x = VELOCIDADE_JOGADOR
-        elif key in (arcade.key.A, arcade.key.LEFT):
-            self.player.change_x = -VELOCIDADE_JOGADOR
-        elif key in (arcade.key.W, arcade.key.UP, arcade.key.SPACE):
+        self.teclas.add(key)
+        if key in (arcade.key.W, arcade.key.UP, arcade.key.SPACE):
             # can_jump() só é True com o jogador apoiado em um bloco: sem pulo duplo
             if self.physics.can_jump():
                 self.physics.jump(FORCA_PULO)
 
     def on_key_release(self, key, modifiers):
-        if key in (arcade.key.D, arcade.key.RIGHT, arcade.key.A, arcade.key.LEFT):
-            self.player.change_x = 0
+        self.teclas.discard(key)
 
 
 class GameOverView(arcade.View):
     TAMANHO_MAX_NOME = 15
 
-    def __init__(self, pontuacao: int, tempo: float, venceu: bool):
+    def __init__(self, pontuacao: int, tempo: float, resultado: str,
+                 vezes_atingido: int = 0):
         super().__init__()
         self.pontuacao = pontuacao
         self.tempo = tempo
-        self.venceu = venceu
+        self.resultado = resultado
+        self.vezes_atingido = vezes_atingido
         self.nome = ""
         self.salvo = False
 
@@ -541,24 +650,29 @@ class GameOverView(arcade.View):
                          tempo_partida=self.tempo)
         self.salvo = True
 
+    def desenhar_resultado(self):
+        if self.resultado == VITORIA_PERFEITA:
+            titulo, cor_titulo = "VITÓRIA PERFEITA!", arcade.color.GOLD
+            mensagem = "Você coletou todas as moedas sem ser atingido nenhuma vez!"
+            cor_msg = arcade.color.GOLD
+        elif self.resultado == VITORIA_NORMAL:
+            titulo, cor_titulo = "VITÓRIA!", arcade.color.GREEN
+            vezes = "vez" if self.vezes_atingido == 1 else "vezes"
+            mensagem = f"Você coletou todas as moedas, mas foi atingido {self.vezes_atingido} {vezes}."
+            cor_msg = arcade.color.WHITE
+        else:
+            titulo, cor_titulo = "DERROTA", arcade.color.RED
+            mensagem = "Os inimigos drenaram sua pontuação! Colete moedas mais rápido."
+            cor_msg = arcade.color.RED
+
+        arcade.draw_text(titulo, LARGURA / 2, ALTURA - 120, cor_titulo,
+                          36, anchor_x="center", bold=True)
+        arcade.draw_text(mensagem, LARGURA / 2, ALTURA / 2 + 60, cor_msg,
+                          18, anchor_x="center")
+
     def on_draw(self):
         self.clear()
-        titulo = "FIM DE JOGO" if self.venceu else "VOCÊ PERDEU"
-        arcade.draw_text(titulo, LARGURA / 2, ALTURA - 120, arcade.color.WHITE,
-                          36, anchor_x="center", bold=True)
-
-        if not self.venceu:
-            arcade.draw_text("Os inimigos drenaram sua pontuação! Colete moedas mais rápido.",
-                              LARGURA / 2, ALTURA / 2 + 60, arcade.color.RED,
-                              18, anchor_x="center")
-        elif self.pontuacao >= TOTAL_MOEDAS:
-            arcade.draw_text("Parabéns! Você escapou de todos os inimigos perfeitamente!",
-                              LARGURA / 2, ALTURA / 2 + 60, arcade.color.GOLD,
-                              20, anchor_x="center")
-        else:
-            arcade.draw_text("Parabéns por concluir o jogo!",
-                              LARGURA / 2, ALTURA / 2 + 60, arcade.color.WHITE,
-                              20, anchor_x="center")
+        self.desenhar_resultado()
 
         arcade.draw_text(f"Pontuação final: {self.pontuacao}", LARGURA / 2, ALTURA / 2 + 20,
                           arcade.color.WHITE, 18, anchor_x="center")
@@ -659,6 +773,9 @@ class JanelaPrincipal(arcade.Window):
 
 
 def main():
+    # garante que "sprites/" e "ranking.db" sejam achados na pasta do código
+    os.chdir(os.path.dirname(os.path.abspath(__file__)))
+    gerar_spritesheet()
     iniciar_banco()
     janela = JanelaPrincipal()
     janela.show_view(MenuView())
